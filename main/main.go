@@ -126,7 +126,6 @@ func scrapeProducts(ctx context.Context, db *sql.DB) error {
 		chromedp.NoSandbox,
 		chromedp.Flag("blink-settings", "scriptEnabled=false, imagesEnabled=false"),
 		chromedp.Flag("ignore-certificate-errors", "true"),
-		chromedp.Flag("disable-http2", "true"), // Experimental flag – may or may not help.
 		chromedp.Flag("disable-extensions", "true"),
 	)
 
@@ -137,29 +136,46 @@ func scrapeProducts(ctx context.Context, db *sql.DB) error {
 		// Create a fresh ExecAllocator and derived context for each URL.
 		allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
 		tbCtx, cancel := chromedp.NewContext(allocCtx)
-		// Increase the timeout to 60 seconds to allow slower pages to load.
-		tbCtx, timeoutCancel := context.WithTimeout(tbCtx, 60*time.Second)
+		// Increase the timeout to 120 seconds to allow slower pages to load.
+		tbCtx, timeoutCancel := context.WithTimeout(tbCtx, 120*time.Second)
 
 		var name, imageURL string
 		var inStock bool
 
-		log.Printf("Navigating to: %s", url)
+		log.Printf("Starting navigation to: %s", url)
 
 		err := chromedp.Run(tbCtx,
 			network.Enable(),
+			// Log when navigation begins
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				log.Printf("Starting page load...")
+				return nil
+			}),
 			chromedp.Navigate(url),
-			// Wait for the <body> to be ready.
-			chromedp.WaitReady("body"),
-			// Wait for a specific element that signifies the product is loaded.
-			// If this selector never appears (maybe due to a CAPTCHA or error), it will timeout.
-			chromedp.WaitVisible(`h1[automation-id="productName"], .product-title, h1`, chromedp.ByQuery),
-			// Evaluate the product name.
+			// Log when navigation completes
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				log.Printf("Page load completed, waiting for body...")
+				return nil
+			}),
+			chromedp.WaitReady("body", chromedp.ByQuery),
+			// Log when body is ready
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				log.Printf("Body ready, waiting for product elements...")
+				return nil
+			}),
+			// Add a more specific wait for Costco's product page structure
+			chromedp.WaitVisible(`#product-page`, chromedp.ByQuery),
+			// Evaluate the product name with more specific Costco selectors
 			chromedp.EvaluateAsDevTools(`
 				(() => {
 					const nameElement = document.querySelector('h1[automation-id="productName"]') ||
 										  document.querySelector('.product-title') ||
 										  document.querySelector('h1');
-					return nameElement ? nameElement.textContent.trim() : '';
+					if (!nameElement) {
+						console.log('Name element not found');
+						return '';
+					}
+					return nameElement.textContent.trim();
 				})()
 			`, &name),
 			// Evaluate if the product is in stock.
@@ -183,7 +199,7 @@ func scrapeProducts(ctx context.Context, db *sql.DB) error {
 			tbCtx, capTimeout := context.WithTimeout(tbCtx, 10*time.Second)
 			var buf []byte
 			if errScr := chromedp.Run(tbCtx, chromedp.FullScreenshot(&buf, 90)); errScr == nil {
-				filename := fmt.Sprintf("screenshots/screenshot_%d.png", time.Now().UnixNano())
+				filename := fmt.Sprintf("./screenshots/screenshot_%d.png", time.Now().UnixNano())
 				if errWrite := os.WriteFile(filename, buf, 0644); errWrite == nil {
 					log.Printf("Saved screenshot for %s as %s", url, filename)
 				} else {
@@ -252,7 +268,8 @@ func startAPI(db *sql.DB) {
 		}
 	}
 
-	http.HandleFunc("/api/products", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	// Create the actual handler for products.
+	productsHandler := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -278,7 +295,9 @@ func startAPI(db *sql.DB) {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(products)
-	}))
+	}
+
+	http.HandleFunc("/api/products", corsMiddleware(productsHandler))
 
 	log.Printf("Starting API server on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
